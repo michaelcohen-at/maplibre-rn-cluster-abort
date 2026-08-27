@@ -127,9 +127,22 @@ function PlainPolygon() {
 }
 
 type Step = { name: string; render: () => ReactNode };
-type Mode = 'idle' | 'repro' | 'control';
+type Mode = 'idle' | 'repro' | 'control' | 'remount';
 
 const SEQUENCES: Record<Exclude<Mode, 'idle'>, Step[]> = {
+	// The SAME clustered source unmounts and remounts under the SAME id — what a
+	// data-driven layer does when it renders null while its next payload loads.
+	// Passes on the unpatched library. It exists to guard the fix: a
+	// prepareForRecycle that recreates the wrapper but leaves `_props` alone never
+	// re-applies an unchanged `id` (Fabric passes oldProps:nullptr on Create and
+	// updateProps diffs against `_props`), so addToMap gets a nil id and segfaults
+	// in strlen. See the fix branch for the correct reset.
+	remount: [
+		{ name: '0 mount CLUSTERED source, 20 Points', render: () => <ClusteredPoints /> },
+		{ name: '1 unmount it (view -> recycle pool)', render: () => null },
+		{ name: '2 mount the SAME clustered source again', render: () => <ClusteredPoints /> },
+		{ name: '3 survived', render: () => <ClusteredPoints /> }
+	],
 	// Clustered first: the recycled view's stale source is CLUSTERED, so the
 	// polygon reaches supercluster. Aborts at step 2.
 	repro: [
@@ -166,7 +179,7 @@ export default function App() {
 	const steps = mode === 'idle' ? null : SEQUENCES[mode];
 
 	useEffect(() => {
-		if (styleLoaded && mode === 'idle' && (AUTORUN === 'repro' || AUTORUN === 'control')) {
+		if (styleLoaded && mode === 'idle' && AUTORUN && AUTORUN in SEQUENCES) {
 			console.log(`[repro] autorun=${AUTORUN}`);
 			console.log(`[repro] ${AUTORUN} step ${SEQUENCES[AUTORUN][0].name}`);
 			setStep(0);
@@ -221,6 +234,13 @@ export default function App() {
 						onPress={() => start('control')}
 					>
 						<Text style={styles.buttonText}>Run control (survives)</Text>
+					</Pressable>
+					<Pressable
+						style={[styles.button, !styleLoaded && styles.disabled]}
+						disabled={!styleLoaded}
+						onPress={() => start('remount')}
+					>
+						<Text style={styles.buttonText}>Run remount (same id)</Text>
 					</Pressable>
 					<Pressable style={[styles.button, styles.muted]} onPress={() => setMode('idle')}>
 						<Text style={styles.buttonText}>Reset</Text>

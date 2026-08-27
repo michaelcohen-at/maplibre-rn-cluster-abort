@@ -63,6 +63,27 @@ In the control, the recycled view retains a non-clustered `MLNShapeSource`. Writ
 features to it does not invoke supercluster, so no exception is thrown. The sole variable between
 the two sequences is the order in which the sources are mounted.
 
+**Run remount (same id)** — a regression guard for the fix, not a reproduction of the bug
+
+| Step | Render | Result (unpatched) |
+|---|---|---|
+| 0 | `<GeoJSONSource id="traps" cluster>` with 20 `Point` features | OK |
+| 1 | nothing | OK |
+| 2 | the same `<GeoJSONSource id="traps" cluster>` again | OK |
+
+This is what a data-driven layer does when it renders `null` while its next payload loads. It
+passes on the unpatched library. It exists because the obvious fix — a `prepareForRecycle` that
+recreates the wrapped `MLRNGeoJSONSource` — is incomplete on its own: Fabric passes
+`oldProps:nullptr` on `Create`, `updateProps` diffs against `_props`, and `_props` still holds the
+previous component's values. Any prop equal to the previous component's (here `id` and `cluster`)
+is therefore never applied to the fresh wrapper, and `addToMap` calls
+`-[MLNStyle sourceWithIdentifier:]` with a nil `id`, which segfaults in `strlen`. The reset of
+`_props` to the default props must accompany the recreation, as `MLRNCameraComponentView.prepareView`
+already does.
+
+Hands-free: `EXPO_PUBLIC_AUTORUN=repro|control|remount npx expo start` starts a sequence as soon as
+the style loads (inlined at bundle time; restart metro after changing it).
+
 ## Expected behaviour
 
 Mounting a non-clustered `GeoJSONSource` creates or adopts a non-clustered native source and
@@ -163,10 +184,11 @@ updated the `data` prop of a mounted source, which is unaffected.
 
 ## Proposed fix
 
-1. `MLRNGeoJSONSourceComponentView`: implement `prepareForRecycle`, either re-running
-   `prepareView` to allocate a fresh `MLRNGeoJSONSource` or clearing `_view.source` and the cached
-   props. This matches the existing behaviour of `MLRNCameraComponentView` and
-   `MLRNLayerComponentView`.
+1. `MLRNGeoJSONSourceComponentView`: implement `prepareForRecycle` — reset `_props` to the
+   default props **and** re-run `prepareView` to allocate a fresh `MLRNGeoJSONSource`. Both halves
+   are required: without the `_props` reset, props equal to the previous component's are never
+   applied to the fresh wrapper (see *Run remount* above). This matches
+   `MLRNCameraComponentView.prepareView`.
 2. `MLRNSource.removeFromMap`: assign `_source = nil` after `removeSource:`, so that `setShape:`
    and `setURL:` cannot address a source that is no longer attached to the component.
 3. `MLRNGeoJSONSource.setShape:`: when `_cluster` is enabled, filter out features whose geometry is
