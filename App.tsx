@@ -1,29 +1,23 @@
 import type { StyleSpecification } from '@maplibre/maplibre-gl-style-spec';
 import { GeoJSONSource, Layer, Map } from '@maplibre/maplibre-react-native';
-import type { FeatureCollection } from 'geojson';
+import type { Feature, FeatureCollection } from 'geojson';
 import { useEffect, useState } from 'react';
-import {
-	SafeAreaView,
-	StyleSheet,
-	Text,
-	TouchableOpacity,
-	View
-} from 'react-native';
+import { SafeAreaView, StyleSheet, Text, View } from 'react-native';
 
 /**
- * Minimal reproduction: a `<GeoJSONSource>` mounted with `cluster` enabled keeps
- * clustering natively after `cluster` is set back to false, and the next `data`
- * push is fed to maplibre's supercluster. Any non-Point geometry then aborts the
- * process (SIGABRT) from C++ — it is not catchable from JS.
+ * Bisecting harness for a native abort in a clustered `<GeoJSONSource>`.
  *
- * Every feature below is valid GeoJSON. The polygon is rendered by a source
- * whose props say `cluster={false}`, so nothing here asks for a clustered
- * polygon source.
+ * The source below stays mounted with `cluster` ENABLED throughout, and only its
+ * `data` prop changes — which is what an app does when it swaps the contents of
+ * a clustered layer. Each step logs `[repro] step N` BEFORE it renders, so the
+ * last line in the log names the payload that killed the process.
  *
- * See README.md for the lines in the iOS implementation that cause it.
+ * A crash here is unrecoverable and invisible to JS: the throw happens in C++
+ * inside supercluster, crosses an Objective-C++ boundary with no handler, and
+ * becomes SIGABRT. No error boundary, no redbox.
  */
 
-/** No network and no glyphs: a background plus circle/fill layers only. */
+/** No network and no glyphs: a background plus circle layers only. */
 const MAP_STYLE: StyleSpecification = {
 	version: 8 as const,
 	name: 'blank',
@@ -37,108 +31,139 @@ const MAP_STYLE: StyleSpecification = {
 	]
 };
 
-/**
- * The SAME source id in both phases. The component is never unmounted — React
- * only updates its props — so this is the plainest possible prop update.
- */
 const SOURCE_ID = 'repro-source';
 
-/** 20 valid Points. */
-const POINTS: FeatureCollection = {
-	type: 'FeatureCollection',
-	features: Array.from({ length: 20 }, (_, i) => ({
-		type: 'Feature',
-		properties: { value: i },
+/** N valid Points, offset so each step is visibly different data. */
+function points(n: number, shift = 0): Feature[] {
+	return Array.from({ length: n }, (_, i) => ({
+		type: 'Feature' as const,
+		properties: { value: i, label: `t${i}` },
 		geometry: {
-			type: 'Point',
-			coordinates: [18.4 + (i % 5) * 0.02, -33.95 + Math.floor(i / 5) * 0.02]
+			type: 'Point' as const,
+			coordinates: [
+				18.4 + (i % 5) * 0.02 + shift,
+				-33.95 + Math.floor(i / 5) * 0.02
+			]
 		}
-	}))
+	}));
+}
+
+const fc = (features: Feature[]): FeatureCollection => ({
+	type: 'FeatureCollection',
+	features
+});
+
+/** A feature with an explicitly null geometry — legal GeoJSON (RFC 7946 §3.2). */
+const NULL_GEOMETRY = {
+	type: 'Feature',
+	properties: { value: 1, label: 'null-geom' },
+	geometry: null
+} as unknown as Feature;
+
+const MULTI_POINT: Feature = {
+	type: 'Feature',
+	properties: { value: 2, label: 'multi' },
+	geometry: {
+		type: 'MultiPoint',
+		coordinates: [
+			[18.44, -33.95],
+			[18.46, -33.93]
+		]
+	}
 };
 
-/** ONE valid Polygon, rendered by a source with `cluster={false}`. */
-const POLYGONS: FeatureCollection = {
-	type: 'FeatureCollection',
-	features: [
-		{
-			type: 'Feature',
-			properties: { name: 'a polygon' },
-			geometry: {
-				type: 'Polygon',
-				coordinates: [
-					[
-						[18.36, -34.0],
-						[18.56, -34.0],
-						[18.56, -33.86],
-						[18.36, -33.86],
-						[18.36, -34.0]
-					]
-				]
-			}
-		}
+const POLYGON: Feature = {
+	type: 'Feature',
+	properties: { value: 3, label: 'poly' },
+	geometry: {
+		type: 'Polygon',
+		coordinates: [
+			[
+				[18.36, -34.0],
+				[18.56, -34.0],
+				[18.56, -33.86],
+				[18.36, -33.86],
+				[18.36, -34.0]
+			]
+		]
+	}
+};
+
+/**
+ * Each step keeps `cluster` enabled and only swaps `data`. Ordered cheapest
+ * hypothesis first, so the last logged step is the culprit.
+ */
+const STEPS: { name: string; data: FeatureCollection }[] = [
+	{ name: '0 baseline: 20 Points', data: fc(points(20)) },
+	// Swapping Points for other Points is fine — this step always survives, and
+	// rules out "replacing a clustered source's data" being the problem on its own.
+	{ name: '1 swap to 12 different Points', data: fc(points(12, 0.05)) },
+	// One feature with `geometry: null` — legal GeoJSON (RFC 7946 section 3.2).
+	// THIS is the step that aborts the process.
+	{
+		name: '2 Points + ONE null-geometry feature',
+		data: fc([...points(8), NULL_GEOMETRY])
+	},
+	// Never reached; kept so the harness can be re-pointed at other shapes.
+	{ name: '3 Points + ONE MultiPoint', data: fc([...points(8, 0.02), MULTI_POINT]) },
+	{ name: '4 Points + ONE Polygon', data: fc([...points(8, 0.04), POLYGON]) }
+];
+
+/**
+ * Matches the cluster aggregation a real app uses — `accumulated` reducers, not
+ * just clusterRadius. Included because it changes which supercluster code path
+ * runs when the data is replaced.
+ */
+const CLUSTER_PROPERTIES = {
+	clusterSum: [
+		['+', ['accumulated'], ['get', 'clusterSum']],
+		['coalesce', ['get', 'value'], 0]
+	],
+	clusterObserved: [
+		['+', ['accumulated'], ['get', 'clusterObserved']],
+		['case', ['>', ['coalesce', ['get', 'value'], -1], -1], 1, 0]
 	]
 };
 
-type Phase = 'clustered-points' | 'plain-polygons';
+const STEP_MS = 2500;
 
 export default function App() {
-	const [phase, setPhase] = useState<Phase>('clustered-points');
+	const [step, setStep] = useState(0);
 	const [styleLoaded, setStyleLoaded] = useState(false);
-	const [armed, setArmed] = useState(true);
 
-	// Self-driving, so reproducing means only launching the app: once the style
-	// is loaded and the clustered source exists natively, flip to the
-	// non-clustered polygon source. The process aborts during that commit.
+	// Self-driving: advance through the payloads once the style is up. The log
+	// line is emitted before the state change so it is flushed ahead of the
+	// native mount that may abort.
 	useEffect(() => {
-		if (!styleLoaded || !armed || phase !== 'clustered-points') return;
+		if (!styleLoaded || step >= STEPS.length - 1) return;
 		const t = setTimeout(() => {
-			console.log(
-				'[repro] switching to cluster={false} + Polygon data — expect SIGABRT'
-			);
-			setPhase('plain-polygons');
-		}, 3000);
+			const next = step + 1;
+			console.log(`[repro] step ${STEPS[next].name}`);
+			setStep(next);
+		}, STEP_MS);
 		return () => clearTimeout(t);
-	}, [styleLoaded, armed, phase]);
+	}, [styleLoaded, step]);
 
-	const clustered = phase === 'clustered-points';
+	useEffect(() => {
+		if (styleLoaded) console.log(`[repro] step ${STEPS[0].name}`);
+	}, [styleLoaded]);
+
+	const current = STEPS[step];
 
 	return (
 		<SafeAreaView style={styles.root}>
 			<View style={styles.bar}>
 				<Text style={styles.title}>maplibre-react-native cluster abort</Text>
 				<Text style={styles.line}>
-					phase: <Text style={styles.mono}>{phase}</Text>
+					step <Text style={styles.mono}>{current.name}</Text>
 				</Text>
 				<Text style={styles.line}>
-					props: <Text style={styles.mono}>cluster={String(clustered)}</Text>
-					{'   '}
-					<Text style={styles.mono}>
-						data={clustered ? '20 x Point' : '1 x Polygon'}
-					</Text>
+					features <Text style={styles.mono}>{current.data.features.length}</Text>
+					{'   '}cluster <Text style={styles.mono}>true (never changes)</Text>
 				</Text>
 				<Text style={styles.line}>
-					style loaded: <Text style={styles.mono}>{String(styleLoaded)}</Text>
+					style loaded <Text style={styles.mono}>{String(styleLoaded)}</Text>
 				</Text>
-				<View style={styles.buttons}>
-					<TouchableOpacity
-						style={styles.button}
-						onPress={() => setPhase('plain-polygons')}
-					>
-						<Text style={styles.buttonText}>Switch now</Text>
-					</TouchableOpacity>
-					<TouchableOpacity
-						style={[styles.button, !armed && styles.buttonOff]}
-						onPress={() => setArmed((a) => !a)}
-					>
-						<Text style={styles.buttonText}>auto: {armed ? 'on' : 'off'}</Text>
-					</TouchableOpacity>
-					<TouchableOpacity
-						style={styles.button}
-						onPress={() => setPhase('clustered-points')}
-					>
-						<Text style={styles.buttonText}>Reset</Text>
-					</TouchableOpacity>
-				</View>
 			</View>
 
 			<Map
@@ -149,35 +174,23 @@ export default function App() {
 				logo={false}
 				onDidFinishLoadingStyle={() => setStyleLoaded(true)}
 			>
-				{/*
-				  One source, one id, one component instance. Only `data` and
-				  `cluster` differ between phases.
-
-				  phase 1 -> cluster: true,  data: Points  (renders clusters)
-				  phase 2 -> cluster: false, data: Polygon (aborts)
-
-				  In phase 2 the props ask for a NON-clustered source, but the
-				  native MLNShapeSource created in phase 1 still has clustering
-				  enabled, and MLRNGeoJSONSourceComponentView applies `data`
-				  BEFORE `cluster`. The polygon reaches supercluster, whose Zoom
-				  ctor calls geometry.get<point<double>>() on every feature and
-				  throws bad_variant_access -> std::terminate -> SIGABRT.
-				*/}
 				<GeoJSONSource
 					id={SOURCE_ID}
-					data={clustered ? POINTS : POLYGONS}
-					cluster={clustered}
+					data={current.data}
+					cluster
 					clusterRadius={20}
+					clusterProperties={CLUSTER_PROPERTIES as never}
 				>
 					<Layer
-						id="repro-circles"
+						id="repro-cluster-circle"
 						type="circle"
 						paint={{ 'circle-radius': 12, 'circle-color': '#3399cc' }}
 					/>
 					<Layer
-						id="repro-fill"
-						type="fill"
-						paint={{ 'fill-color': '#cc3333', 'fill-opacity': 0.5 }}
+						id="repro-cluster-count"
+						type="circle"
+						filter={['has', 'point_count']}
+						paint={{ 'circle-radius': 16, 'circle-color': '#2b6cb0' }}
 					/>
 				</GeoJSONSource>
 			</Map>
@@ -191,14 +204,5 @@ const styles = StyleSheet.create({
 	title: { color: '#fff', fontSize: 15, fontWeight: '700', marginBottom: 4 },
 	line: { color: '#c8cdd4', fontSize: 12 },
 	mono: { fontFamily: 'Menlo', color: '#7fd1b9', fontSize: 11 },
-	buttons: { flexDirection: 'row', gap: 8, marginTop: 10 },
-	button: {
-		backgroundColor: '#2b6cb0',
-		paddingVertical: 8,
-		paddingHorizontal: 12,
-		borderRadius: 6
-	},
-	buttonOff: { backgroundColor: '#4a5568' },
-	buttonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
 	map: { flex: 1 }
 });
