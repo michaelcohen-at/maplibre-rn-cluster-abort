@@ -1,5 +1,5 @@
 import type { StyleSpecification } from '@maplibre/maplibre-gl-style-spec';
-import { GeoJSONSource, Layer, Map } from '@maplibre/maplibre-react-native';
+import { Camera, GeoJSONSource, Layer, Map } from '@maplibre/maplibre-react-native';
 import type { Feature, FeatureCollection } from 'geojson';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
@@ -150,12 +150,29 @@ const SEQUENCES: Record<Exclude<Mode, 'idle'>, Step[]> = {
 
 const STEP_MS = 2500;
 
+/**
+ * Optional hands-free mode for CI or a maintainer verifying a fix:
+ *   EXPO_PUBLIC_AUTORUN=repro npx expo start   # starts the repro once the style loads
+ *   EXPO_PUBLIC_AUTORUN=control npx expo start
+ * Inlined at bundle time, so restart metro after changing it.
+ */
+const AUTORUN = process.env.EXPO_PUBLIC_AUTORUN as Exclude<Mode, 'idle'> | undefined;
+
 export default function App() {
 	const [mode, setMode] = useState<Mode>('idle');
 	const [step, setStep] = useState(0);
 	const [styleLoaded, setStyleLoaded] = useState(false);
 
 	const steps = mode === 'idle' ? null : SEQUENCES[mode];
+
+	useEffect(() => {
+		if (styleLoaded && mode === 'idle' && (AUTORUN === 'repro' || AUTORUN === 'control')) {
+			console.log(`[repro] autorun=${AUTORUN}`);
+			console.log(`[repro] ${AUTORUN} step ${SEQUENCES[AUTORUN][0].name}`);
+			setStep(0);
+			setMode(AUTORUN);
+		}
+	}, [styleLoaded, mode]);
 
 	// A run is self-driving once started. Each step is logged BEFORE the state
 	// change so the log line is flushed ahead of the native commit that may
@@ -219,6 +236,8 @@ export default function App() {
 				logo={false}
 				onDidFinishLoadingStyle={() => setStyleLoaded(true)}
 			>
+				{/* Frame the data so each step's render is visible; not part of the bug. */}
+				<Camera initialViewState={{ center: [18.46, -33.93], zoom: 10 }} />
 				{current ? current.render() : null}
 			</Map>
 		</SafeAreaView>
