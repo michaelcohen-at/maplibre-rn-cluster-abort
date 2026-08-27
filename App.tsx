@@ -1,23 +1,43 @@
 import type { StyleSpecification } from '@maplibre/maplibre-gl-style-spec';
 import { GeoJSONSource, Layer, Map } from '@maplibre/maplibre-react-native';
 import type { Feature, FeatureCollection } from 'geojson';
+import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
-import { SafeAreaView, StyleSheet, Text, View } from 'react-native';
+import {
+	Pressable,
+	SafeAreaView,
+	StyleSheet,
+	Text,
+	View
+} from 'react-native';
 
 /**
- * Bisecting harness for a native abort in a clustered `<GeoJSONSource>`.
+ * Minimal reproduction of a native abort caused by Fabric view recycling in
+ * `<GeoJSONSource>`.
  *
- * The source below stays mounted with `cluster` ENABLED throughout, and only its
- * `data` prop changes — which is what an app does when it swaps the contents of
- * a clustered layer. Each step logs `[repro] step N` BEFORE it renders, so the
- * last line in the log names the payload that killed the process.
+ *   1. Mount a CLUSTERED source with Point data.                 (fine)
+ *   2. Unmount it. Its component view goes to Fabric's recycle pool.
+ *   3. Mount a DIFFERENT, non-clustered source with a Polygon.   <- SIGABRT
  *
- * A crash here is unrecoverable and invisible to JS: the throw happens in C++
- * inside supercluster, crosses an Objective-C++ boundary with no handler, and
- * becomes SIGABRT. No error boundary, no redbox.
+ * Step 3 dequeues the recycled view from step 1. `MLRNGeoJSONSourceComponentView`
+ * does not implement `prepareForRecycle`, so the view still owns the previous
+ * `MLRNGeoJSONSource`, whose `source` property still points at the OLD, still-
+ * clustered `MLNShapeSource` (`removeFromMap` never nils it). `updateProps`
+ * pushes the new `data` first, `setShape:` sees `self.source != nil`, and the
+ * polygon is fed to supercluster — which requires Points and throws
+ * `bad_variant_access` from C++. That crosses an ObjC++ boundary with no handler
+ * and becomes std::terminate → SIGABRT. Nothing in JS can catch it.
+ *
+ * The CONTROL runs the same three steps in the opposite order. The recycled
+ * view then carries a stale but ordinary source, points are pushed into it
+ * harmlessly, and the app survives. The only difference between the two runs is
+ * which source was mounted first.
+ *
+ * Both sources have valid GeoJSON and correct props. The polygon source never
+ * asks for clustering. Different ids, different keys — they are unrelated
+ * components that happen to share a native view class.
  */
 
-/** No network and no glyphs: a background plus circle layers only. */
 const MAP_STYLE: StyleSpecification = {
 	version: 8 as const,
 	name: 'blank',
@@ -31,139 +51,164 @@ const MAP_STYLE: StyleSpecification = {
 	]
 };
 
-const SOURCE_ID = 'repro-source';
-
-/** N valid Points, offset so each step is visibly different data. */
-function points(n: number, shift = 0): Feature[] {
-	return Array.from({ length: n }, (_, i) => ({
-		type: 'Feature' as const,
-		properties: { value: i, label: `t${i}` },
+const POINTS: FeatureCollection = {
+	type: 'FeatureCollection',
+	features: Array.from({ length: 20 }, (_, i): Feature => ({
+		type: 'Feature',
+		properties: { value: i },
 		geometry: {
-			type: 'Point' as const,
-			coordinates: [
-				18.4 + (i % 5) * 0.02 + shift,
-				-33.95 + Math.floor(i / 5) * 0.02
-			]
+			type: 'Point',
+			coordinates: [18.4 + (i % 5) * 0.02, -33.95 + Math.floor(i / 5) * 0.02]
 		}
-	}));
+	}))
+};
+
+const POLYGON: FeatureCollection = {
+	type: 'FeatureCollection',
+	features: [
+		{
+			type: 'Feature',
+			properties: { name: 'a block' },
+			geometry: {
+				type: 'Polygon',
+				coordinates: [
+					[
+						[18.36, -34.0],
+						[18.56, -34.0],
+						[18.56, -33.86],
+						[18.36, -33.86],
+						[18.36, -34.0]
+					]
+				]
+			}
+		}
+	]
+};
+
+/** Real-world cluster aggregation (`accumulated` reducers), as an app would use. */
+const CLUSTER_PROPERTIES = {
+	sum: [
+		['+', ['accumulated'], ['get', 'sum']],
+		['coalesce', ['get', 'value'], 0]
+	]
+};
+
+/** A clustered point source — think "pest traps". */
+function ClusteredPoints() {
+	return (
+		<GeoJSONSource
+			key="traps"
+			id="traps"
+			data={POINTS}
+			cluster
+			clusterRadius={20}
+			clusterProperties={CLUSTER_PROPERTIES as never}
+		>
+			<Layer
+				id="traps-circle"
+				type="circle"
+				paint={{ 'circle-radius': 12, 'circle-color': '#3399cc' }}
+			/>
+		</GeoJSONSource>
+	);
 }
 
-const fc = (features: Feature[]): FeatureCollection => ({
-	type: 'FeatureCollection',
-	features
-});
+/** An ordinary polygon source — think "field blocks". No clustering. */
+function PlainPolygon() {
+	return (
+		<GeoJSONSource key="blocks" id="blocks" data={POLYGON}>
+			<Layer
+				id="blocks-fill"
+				type="fill"
+				paint={{ 'fill-color': '#cc3333', 'fill-opacity': 0.5 }}
+			/>
+		</GeoJSONSource>
+	);
+}
 
-/** A feature with an explicitly null geometry — legal GeoJSON (RFC 7946 §3.2). */
-const NULL_GEOMETRY = {
-	type: 'Feature',
-	properties: { value: 1, label: 'null-geom' },
-	geometry: null
-} as unknown as Feature;
+type Step = { name: string; render: () => ReactNode };
+type Mode = 'idle' | 'repro' | 'control';
 
-const MULTI_POINT: Feature = {
-	type: 'Feature',
-	properties: { value: 2, label: 'multi' },
-	geometry: {
-		type: 'MultiPoint',
-		coordinates: [
-			[18.44, -33.95],
-			[18.46, -33.93]
-		]
-	}
-};
-
-const POLYGON: Feature = {
-	type: 'Feature',
-	properties: { value: 3, label: 'poly' },
-	geometry: {
-		type: 'Polygon',
-		coordinates: [
-			[
-				[18.36, -34.0],
-				[18.56, -34.0],
-				[18.56, -33.86],
-				[18.36, -33.86],
-				[18.36, -34.0]
-			]
-		]
-	}
-};
-
-/**
- * Each step keeps `cluster` enabled and only swaps `data`. Ordered cheapest
- * hypothesis first, so the last logged step is the culprit.
- */
-const STEPS: { name: string; data: FeatureCollection }[] = [
-	{ name: '0 baseline: 20 Points', data: fc(points(20)) },
-	// Swapping Points for other Points is fine — this step always survives, and
-	// rules out "replacing a clustered source's data" being the problem on its own.
-	{ name: '1 swap to 12 different Points', data: fc(points(12, 0.05)) },
-	// One feature with `geometry: null` — legal GeoJSON (RFC 7946 section 3.2).
-	// THIS is the step that aborts the process.
-	{
-		name: '2 Points + ONE null-geometry feature',
-		data: fc([...points(8), NULL_GEOMETRY])
-	},
-	// Never reached; kept so the harness can be re-pointed at other shapes.
-	{ name: '3 Points + ONE MultiPoint', data: fc([...points(8, 0.02), MULTI_POINT]) },
-	{ name: '4 Points + ONE Polygon', data: fc([...points(8, 0.04), POLYGON]) }
-];
-
-/**
- * Matches the cluster aggregation a real app uses — `accumulated` reducers, not
- * just clusterRadius. Included because it changes which supercluster code path
- * runs when the data is replaced.
- */
-const CLUSTER_PROPERTIES = {
-	clusterSum: [
-		['+', ['accumulated'], ['get', 'clusterSum']],
-		['coalesce', ['get', 'value'], 0]
+const SEQUENCES: Record<Exclude<Mode, 'idle'>, Step[]> = {
+	// Clustered first: the recycled view's stale source is CLUSTERED, so the
+	// polygon reaches supercluster. Aborts at step 2.
+	repro: [
+		{ name: '0 mount CLUSTERED source, 20 Points', render: () => <ClusteredPoints /> },
+		{ name: '1 unmount it (view -> recycle pool)', render: () => null },
+		{ name: '2 mount PLAIN source, 1 Polygon  <- SIGABRT here', render: () => <PlainPolygon /> },
+		{ name: '3 survived — bug NOT reproduced', render: () => <PlainPolygon /> }
 	],
-	clusterObserved: [
-		['+', ['accumulated'], ['get', 'clusterObserved']],
-		['case', ['>', ['coalesce', ['get', 'value'], -1], -1], 1, 0]
+	// Plain first: the stale source is an ordinary one, so pushing points into
+	// it is harmless. Survives.
+	control: [
+		{ name: '0 mount PLAIN source, 1 Polygon', render: () => <PlainPolygon /> },
+		{ name: '1 unmount it (view -> recycle pool)', render: () => null },
+		{ name: '2 mount CLUSTERED source, 20 Points', render: () => <ClusteredPoints /> },
+		{ name: '3 survived, as expected', render: () => <ClusteredPoints /> }
 	]
 };
 
 const STEP_MS = 2500;
 
 export default function App() {
+	const [mode, setMode] = useState<Mode>('idle');
 	const [step, setStep] = useState(0);
 	const [styleLoaded, setStyleLoaded] = useState(false);
 
-	// Self-driving: advance through the payloads once the style is up. The log
-	// line is emitted before the state change so it is flushed ahead of the
-	// native mount that may abort.
+	const steps = mode === 'idle' ? null : SEQUENCES[mode];
+
+	// A run is self-driving once started. Each step is logged BEFORE the state
+	// change so the log line is flushed ahead of the native commit that may
+	// abort: the last `[repro]` line in the device log names the fatal step.
 	useEffect(() => {
-		if (!styleLoaded || step >= STEPS.length - 1) return;
+		if (!steps || step >= steps.length - 1) return;
 		const t = setTimeout(() => {
 			const next = step + 1;
-			console.log(`[repro] step ${STEPS[next].name}`);
+			console.log(`[repro] ${mode} step ${steps[next].name}`);
 			setStep(next);
 		}, STEP_MS);
 		return () => clearTimeout(t);
-	}, [styleLoaded, step]);
+	}, [mode, steps, step]);
 
-	useEffect(() => {
-		if (styleLoaded) console.log(`[repro] step ${STEPS[0].name}`);
-	}, [styleLoaded]);
+	const start = (next: Exclude<Mode, 'idle'>) => {
+		console.log(`[repro] ${next} step ${SEQUENCES[next][0].name}`);
+		setStep(0);
+		setMode(next);
+	};
 
-	const current = STEPS[step];
+	const current = steps?.[step];
 
 	return (
 		<SafeAreaView style={styles.root}>
 			<View style={styles.bar}>
-				<Text style={styles.title}>maplibre-react-native cluster abort</Text>
-				<Text style={styles.line}>
-					step <Text style={styles.mono}>{current.name}</Text>
-				</Text>
-				<Text style={styles.line}>
-					features <Text style={styles.mono}>{current.data.features.length}</Text>
-					{'   '}cluster <Text style={styles.mono}>true (never changes)</Text>
-				</Text>
+				<Text style={styles.title}>maplibre-react-native: recycled clustered source</Text>
 				<Text style={styles.line}>
 					style loaded <Text style={styles.mono}>{String(styleLoaded)}</Text>
+					{'   '}mode <Text style={styles.mono}>{mode}</Text>
 				</Text>
+				<Text style={styles.line}>
+					step{' '}
+					<Text style={styles.mono}>{current ? current.name : '— press a button —'}</Text>
+				</Text>
+				<View style={styles.buttons}>
+					<Pressable
+						style={[styles.button, styles.danger, !styleLoaded && styles.disabled]}
+						disabled={!styleLoaded}
+						onPress={() => start('repro')}
+					>
+						<Text style={styles.buttonText}>Run repro (crashes)</Text>
+					</Pressable>
+					<Pressable
+						style={[styles.button, !styleLoaded && styles.disabled]}
+						disabled={!styleLoaded}
+						onPress={() => start('control')}
+					>
+						<Text style={styles.buttonText}>Run control (survives)</Text>
+					</Pressable>
+					<Pressable style={[styles.button, styles.muted]} onPress={() => setMode('idle')}>
+						<Text style={styles.buttonText}>Reset</Text>
+					</Pressable>
+				</View>
 			</View>
 
 			<Map
@@ -174,25 +219,7 @@ export default function App() {
 				logo={false}
 				onDidFinishLoadingStyle={() => setStyleLoaded(true)}
 			>
-				<GeoJSONSource
-					id={SOURCE_ID}
-					data={current.data}
-					cluster
-					clusterRadius={20}
-					clusterProperties={CLUSTER_PROPERTIES as never}
-				>
-					<Layer
-						id="repro-cluster-circle"
-						type="circle"
-						paint={{ 'circle-radius': 12, 'circle-color': '#3399cc' }}
-					/>
-					<Layer
-						id="repro-cluster-count"
-						type="circle"
-						filter={['has', 'point_count']}
-						paint={{ 'circle-radius': 16, 'circle-color': '#2b6cb0' }}
-					/>
-				</GeoJSONSource>
+				{current ? current.render() : null}
 			</Map>
 		</SafeAreaView>
 	);
@@ -200,9 +227,20 @@ export default function App() {
 
 const styles = StyleSheet.create({
 	root: { flex: 1, backgroundColor: '#101418' },
-	bar: { padding: 12, gap: 3 },
-	title: { color: '#fff', fontSize: 15, fontWeight: '700', marginBottom: 4 },
+	bar: { padding: 12, gap: 4 },
+	title: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 4 },
 	line: { color: '#c8cdd4', fontSize: 12 },
 	mono: { fontFamily: 'Menlo', color: '#7fd1b9', fontSize: 11 },
+	buttons: { flexDirection: 'row', gap: 8, marginTop: 8, flexWrap: 'wrap' },
+	button: {
+		backgroundColor: '#2b6cb0',
+		paddingVertical: 8,
+		paddingHorizontal: 12,
+		borderRadius: 6
+	},
+	danger: { backgroundColor: '#c53030' },
+	muted: { backgroundColor: '#4a5568' },
+	disabled: { opacity: 0.4 },
+	buttonText: { color: '#fff', fontSize: 12, fontWeight: '600' },
 	map: { flex: 1 }
 });

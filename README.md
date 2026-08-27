@@ -1,46 +1,78 @@
-# A single `geometry: null` feature in a clustered `GeoJSONSource` aborts the process
+# iOS: recycled `GeoJSONSource` component view retains a clustered `MLNShapeSource`, causing SIGABRT on next mount
 
-Pushing a `FeatureCollection` that contains **one feature with `geometry: null`** into a
-`<GeoJSONSource cluster>` kills the app with `SIGABRT`.
+## Summary
 
-`geometry: null` is legal GeoJSON — [RFC 7946 §3.2](https://datatracker.ietf.org/doc/html/rfc7946#section-3.2)
-says a Feature's `geometry` member "MAY be null". But maplibre's clustering path calls
-`geometry.get<mapbox::geometry::point<double>>()` on every feature, which throws
-`mapbox::util::bad_variant_access` for a null geometry (it deserializes to
-`mapbox::geometry::empty`, the first member of that variant).
+When a `<GeoJSONSource cluster>` is unmounted and a non-clustered `<GeoJSONSource>` is subsequently
+mounted, Fabric supplies the second component with the first component's recycled
+`MLRNGeoJSONSourceComponentView`. That view still references the first component's
+`MLNShapeSource`, which was constructed with clustering enabled. The second component's `data` is
+written to this stale source via `setShape:`. Supercluster requires `Point` geometries; any other
+geometry type causes `mapbox::util::variant::get<point<double>>()` to throw
+`bad_variant_access`. The exception propagates through an Objective-C++ frame with no handler,
+resulting in `std::terminate` and `SIGABRT`.
 
-The throw happens in C++, crosses an Objective-C++ boundary with no handler, and becomes
-`std::terminate` → `abort`. **It is not catchable from JavaScript** — no error boundary, no redbox,
-no JS stack. The app simply dies, which makes it very hard to attribute in production.
+The two components are unrelated: different `id`, different React key, valid GeoJSON, correct
+props. The failure is not observable or catchable from JavaScript.
 
-| | |
+## Environment
+
+| Component | Version |
 |---|---|
-| `@maplibre/maplibre-react-native` | `11.3.6` |
-| `react-native` | `0.86.3` (new architecture / Fabric) |
-| `expo` | `~57.0.17` |
-| Reproduced on | iOS 26.4 simulator; iOS 26.6 / 26.6.1 devices (iPhone 15 Pro, iPhone 17) |
+| `@maplibre/maplibre-react-native` | 11.3.6 |
+| `react-native` | 0.86.3, new architecture (Fabric) |
+| `expo` | ~57.0.17 |
+| Platforms | iOS 26.4 (simulator); iOS 26.6, 26.6.1 (iPhone 15 Pro, iPhone 17) |
 
-## Reproduce
+Android has not been tested.
+
+## Steps to reproduce
 
 ```bash
 npm install
-npx expo prebuild --platform ios     # the config plugin must be in app.json "plugins",
-npx expo run:ios                     # otherwise the build fails: 'MapLibre/MapLibre.h' not found
+npx expo prebuild --platform ios
+npx expo run:ios
 ```
 
-No interaction needed. The app renders one `<GeoJSONSource>` with `cluster` enabled — **`cluster`
-never changes** — and steps its `data` prop every 2.5s, logging each step before it renders:
+`app.json` must list `@maplibre/maplibre-react-native` under `plugins`; without the config plugin
+the iOS build fails with `'MapLibre/MapLibre.h' file not found`.
 
-```
-[repro] step 0 baseline: 20 Points                    <- fine
-[repro] step 1 swap to 12 different Points            <- fine
-[repro] step 2 Points + ONE null-geometry feature     <- SIGABRT here
-```
+The app exposes two buttons. Each executes a three-step sequence with a 2.5 s interval, emitting
+`[repro] <mode> step N` to the console before each render. The final logged line therefore
+identifies the step during which the process terminated.
 
-Step 1 is deliberate: replacing a clustered source's data is *not* the problem on its own. Only the
-null geometry is.
+**Run repro**
 
-## Stack
+| Step | Render | Result |
+|---|---|---|
+| 0 | `<GeoJSONSource id="traps" cluster>` with 20 `Point` features | OK |
+| 1 | nothing (source unmounted; view enters the recycle pool) | OK |
+| 2 | `<GeoJSONSource id="blocks">` with 1 `Polygon` feature | **SIGABRT** |
+
+**Run control**
+
+Identical operations in reverse order.
+
+| Step | Render | Result |
+|---|---|---|
+| 0 | `<GeoJSONSource id="blocks">` with 1 `Polygon` feature | OK |
+| 1 | nothing | OK |
+| 2 | `<GeoJSONSource id="traps" cluster>` with 20 `Point` features | OK |
+| 3 | unchanged | OK |
+
+In the control, the recycled view retains a non-clustered `MLNShapeSource`. Writing `Point`
+features to it does not invoke supercluster, so no exception is thrown. The sole variable between
+the two sequences is the order in which the sources are mounted.
+
+## Expected behaviour
+
+Mounting a non-clustered `GeoJSONSource` creates or adopts a non-clustered native source and
+renders the supplied geometry.
+
+## Actual behaviour
+
+The process aborts during the Fabric mount transaction for the second source.
+
+## Stack trace
 
 ```
 libc++abi   __cxa_throw
@@ -59,13 +91,42 @@ app         -[MLRNGeoJSONSourceComponentView updateProps:oldProps:]             
 React       RCTPerformMountInstructions                                          (RCTMountingManager.mm:83)
 ```
 
-Note `mapbox::geometry::empty` as the first variant member — that is the null geometry.
+`RCTMountingManager.mm:83` is the `ShadowViewMutation::Create` case, which calls
+`updateProps:oldProps:nullptr` on the view returned by
+`dequeueComponentViewWithComponentHandle:`.
 
-## Suggested fix
+## Root cause
 
-`-[MLRNGeoJSONSource setShape:]` is the last place that can prevent this cheaply. When the source is
-clustered, features whose geometry is not a `Point` cannot be clustered by supercluster at all, so
-dropping them (with an `RCTLogWarn`) turns a process abort into a render no-op:
+Four conditions in the iOS implementation combine. Line references are to
+`@maplibre/maplibre-react-native@11.3.6`; the React Native references are to 0.86.3.
+
+**1. The component view is recycled with its native state intact.**
+`RCTComponentViewDescriptor.shouldBeRecycled` defaults to `true`, and `RCTComponentViewRegistry`
+maintains a per-component-handle LIFO pool. `RCTViewComponentView.prepareForRecycle` resets only
+base-class state. `MLRNGeoJSONSourceComponentView` overrides neither `prepareForRecycle` nor
+`shouldBeRecycled`, so its `_view` ivar — the `MLRNGeoJSONSource` instance holding `_source`,
+`_shape`, `_cluster`, `_clusterRadius` and `_clusterProperties` — is carried unchanged into the
+next component that dequeues the view. `MLRNCameraComponentView` and `MLRNLayerComponentView` do
+implement `prepareForRecycle`.
+
+**2. `removeFromMap` does not release the native source.**
+`ios/components/sources/MLRNSource.m`:
+
+```objc
+- (void)removeFromMap {
+  ...
+  if (_source != nil) {
+    [_map.style removeSource:_source];
+  }
+  // _source is not set to nil
+}
+```
+
+No code under `ios/components/sources/` assigns `nil` to `source`. The removed `MLNShapeSource`
+remains valid; `setShape:` on it still reaches `mbgl::style::GeoJSONSource::setGeoJSON`.
+
+**3. `setShape:` writes to whatever `source` references.**
+`ios/components/sources/geojson-source/MLRNGeoJSONSource.m`:
 
 ```objc
 - (void)setShape:(NSString *)shape {
@@ -77,29 +138,50 @@ dropping them (with an `RCTLogWarn`) turns a process abort into a render no-op:
 }
 ```
 
-Doing it in the shared native layer is preferable to asking every app to pre-filter, because the
-failure mode is a hard crash with no JS-side signal.
+On a recycled view, `self.source` is the previous component's clustered source.
 
-## A second, related problem
+**4. `updateProps` applies `data` before any other prop, and cluster options are immutable.**
+`MLRNGeoJSONSourceComponentView.mm` writes `data` (line 79) before `cluster` (line 83) and the
+remaining cluster options (lines 87–106). Independently, `_getOptions` is invoked only from
+`makeSource`, and `MLNShapeSource` options cannot be changed after construction, so updating the
+cluster props has no effect on an existing source in any case.
 
-`cluster` and the other clustering props cannot be changed after mount, so an app cannot even work
-around the above by turning clustering off:
+Sequence at step 2 of the repro: `dequeueComponentViewWithComponentHandle:` returns the recycled
+view → `updateProps:oldProps:nullptr` → `data` differs → `setReactData:` → `setShape:` →
+`self.source` is the stale clustered `MLNShapeSource` → `setGeoJSON` → `SuperclusterData` →
+`get<point<double>>()` on a `Polygon` → throw → abort. This occurs before `addToMap` is called for
+the new component.
 
-- `MLRNGeoJSONSource.m` — `_getOptions` (which builds `cluster`, `clusterRadius`,
-  `clusterProperties`) is called from exactly one place, `makeSource`. `MLNShapeSource` options are
-  immutable after construction.
-- `MLRNGeoJSONSourceComponentView.mm` — `updateProps` pushes `data` at line 79, *before* `cluster`
-  at line 83, so even a rebuild-on-change would receive the new data first.
-- `MLRNSource.m` — `addToMap` adopts an existing style source by id (`_source = existingSource`)
-  without comparing options; `removeFromMap` removes the source from the style but leaves `_source`
-  set, and `setShape:` only guards on `self.source != nil`, so a removed source still accepts data
-  pushes. `MLRNGeoJSONSourceComponentView` also does not implement `prepareForRecycle`, unlike
-  `MLRNCameraComponentView` and `MLRNLayerComponentView`.
+## Trigger conditions in production
 
-Setting `cluster={false}` on a mounted source and pushing a `Polygon` therefore aborts in the same
-way. `git log` in this repo has that variant as its first commit if it is useful.
+The defect requires a clustered `GeoJSONSource` to unmount and a non-clustered `GeoJSONSource` to
+mount at any later point. Typical causes are a data-driven layer rendering `null` while a new
+payload loads, screen navigation, or a change of map context. In the originating application the
+crash occurred when stepping between dates on a clustered layer, and only when the target date was
+not yet cached: uncached data caused the source to unmount during the fetch, whereas cached data
+updated the `data` prop of a mounted source, which is unaffected.
 
-## Why this matters
+## Proposed fix
 
-In our app this surfaced as a crash when users switched between map layers — no JS error, no
-attribution, just process death on devices in the field.
+1. `MLRNGeoJSONSourceComponentView`: implement `prepareForRecycle`, either re-running
+   `prepareView` to allocate a fresh `MLRNGeoJSONSource` or clearing `_view.source` and the cached
+   props. This matches the existing behaviour of `MLRNCameraComponentView` and
+   `MLRNLayerComponentView`.
+2. `MLRNSource.removeFromMap`: assign `_source = nil` after `removeSource:`, so that `setShape:`
+   and `setURL:` cannot address a source that is no longer attached to the component.
+3. `MLRNGeoJSONSource.setShape:`: when `_cluster` is enabled, filter out features whose geometry is
+   not `Point` and emit `RCTLogWarn`. Supercluster cannot process them, and this converts a process
+   abort into a logged no-op for any remaining path, including the related issue below.
+
+Additionally, applying the cluster options before `data` in `updateProps`, and recreating the
+`MLNShapeSource` when those options change, would make `cluster` mutable after mount. It is not
+currently.
+
+## Related: `geometry: null` in a clustered source
+
+With `cluster` enabled and only `data` changing on a mounted source, replacing `Point` features
+with other `Point` features is safe, but a single feature with `geometry: null` — permitted by
+[RFC 7946 §3.2](https://datatracker.ietf.org/doc/html/rfc7946#section-3.2) — aborts with the same
+stack. The null geometry deserialises to `mapbox::geometry::empty`, the first alternative of the
+variant shown in frame 1. Proposed fix 3 covers this case. Commit `5b5eff1` in this repository is
+a standalone harness for it.
