@@ -3,14 +3,7 @@ import { Camera, GeoJSONSource, Layer, Map } from '@maplibre/maplibre-react-nati
 import type { Feature, FeatureCollection } from 'geojson';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
-import {
-	LogBox,
-	Pressable,
-	SafeAreaView,
-	StyleSheet,
-	Text,
-	View
-} from 'react-native';
+import { LogBox, Pressable, StyleSheet, Text, View } from 'react-native';
 
 // MapLibre's own deprecation notice (automaticallyAdjustsScrollViewInsets), not
 // part of this bug; keep it out of the LogBox so recordings show only the repro.
@@ -214,7 +207,7 @@ export default function App() {
 	const current = steps?.[step];
 
 	return (
-		<SafeAreaView style={styles.root}>
+		<View style={styles.root}>
 			<View style={styles.bar}>
 				<Text style={styles.title}>maplibre-react-native: recycled clustered source</Text>
 				<Text style={styles.line}>
@@ -265,12 +258,12 @@ export default function App() {
 				<Camera initialViewState={{ center: [18.46, -33.93], zoom: 10 }} />
 				{current ? current.render() : null}
 			</Map>
-		</SafeAreaView>
+		</View>
 	);
 }
 
 const styles = StyleSheet.create({
-	root: { flex: 1, backgroundColor: '#101418' },
+	root: { flex: 1, backgroundColor: '#101418', paddingTop: 60 },
 	bar: { padding: 12, gap: 4 },
 	title: { color: '#fff', fontSize: 14, fontWeight: '700', marginBottom: 4 },
 	line: { color: '#c8cdd4', fontSize: 12 },
