@@ -4,12 +4,17 @@ import type { Feature, FeatureCollection } from 'geojson';
 import type { ReactNode } from 'react';
 import { useEffect, useState } from 'react';
 import {
+	LogBox,
 	Pressable,
 	SafeAreaView,
 	StyleSheet,
 	Text,
 	View
 } from 'react-native';
+
+// MapLibre's own deprecation notice (automaticallyAdjustsScrollViewInsets), not
+// part of this bug; keep it out of the LogBox so recordings show only the repro.
+LogBox.ignoreLogs([/automaticallyAdjustsScrollViewInsets/]);
 
 /**
  * Minimal reproduction of a native abort caused by Fabric view recycling in
