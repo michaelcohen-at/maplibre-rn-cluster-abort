@@ -82,7 +82,8 @@ is therefore never applied to the fresh wrapper, and `addToMap` calls
 already does.
 
 Hands-free: `EXPO_PUBLIC_AUTORUN=repro|control|remount npx expo start` starts a sequence as soon as
-the style loads (inlined at bundle time; restart metro after changing it).
+the style loads. It is inlined at bundle time and metro caches the result, so restart metro with
+`--clear` after changing it.
 
 ## Expected behaviour
 

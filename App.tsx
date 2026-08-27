@@ -165,7 +165,8 @@ const STEP_MS = 2500;
  * Optional hands-free mode for CI or a maintainer verifying a fix:
  *   EXPO_PUBLIC_AUTORUN=repro npx expo start   # starts the repro once the style loads
  *   EXPO_PUBLIC_AUTORUN=control npx expo start
- * Inlined at bundle time, so restart metro after changing it.
+ * Inlined at bundle time and cached by metro, so restart metro with --clear after
+ * changing it.
  */
 const AUTORUN = process.env.EXPO_PUBLIC_AUTORUN as Exclude<Mode, 'idle'> | undefined;
 
