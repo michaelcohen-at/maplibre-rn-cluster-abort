@@ -7,9 +7,11 @@
 >
 > The patch makes the three changes listed under *Proposed fix*, each also proposed in
 > [maplibre/maplibre-react-native#1635](https://github.com/maplibre/maplibre-react-native/issues/1635).
-> Verified on the iOS 26.4 simulator: repro survives, control survives, and the `setShape:` filter's
-> warning never fires — fixes 1 and 2 stop the stale source being reached at all, so fix 3 stays
-> dormant as defence in depth.
+> Verified on the iOS 26.4 simulator: repro survives, control survives, remount (same id) survives,
+> and the `setShape:` filter's warning never fires — fixes 1 and 2 stop the stale source being
+> reached at all, so fix 3 stays dormant as defence in depth. An earlier revision of this patch that
+> recreated the wrapper without resetting `_props` passed repro and control but segfaulted on
+> remount; that is why the remount sequence exists.
 >
 > ```bash
 > git checkout fix/recycled-clustered-source

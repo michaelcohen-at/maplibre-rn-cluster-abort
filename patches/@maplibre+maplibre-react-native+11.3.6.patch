@@ -81,10 +81,10 @@ index aa913f8..0913d1b 100644
    }
  
 diff --git a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
-index 4301ae7..bcde404 100644
+index 4301ae7..2a9ee9a 100644
 --- a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
 +++ b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
-@@ -62,6 +62,18 @@ using namespace facebook::react;
+@@ -62,6 +62,26 @@ using namespace facebook::react;
    return _view;
  }
  
@@ -97,6 +97,14 @@ index 4301ae7..bcde404 100644
 +  // receiving non-Point features aborts the process from C++ (bad_variant_access in
 +  // supercluster). Start the next life with a fresh wrapper, as MLRNCameraComponentView
 +  // and MLRNLayerComponentView already do. See maplibre/maplibre-react-native#1635.
++  // And forget the previous props. Fabric passes oldProps:nullptr on Create, and
++  // updateProps diffs against _props — so without this reset, any prop that is
++  // EQUAL to the previous component's (a source remounting under the same id, the
++  // same cluster flag) is never applied to the fresh wrapper. A nil id then reaches
++  // -[MLNStyle sourceWithIdentifier:] and segfaults in strlen. Same pattern as
++  // MLRNCameraComponentView.prepareView.
++  static const auto defaultProps = std::make_shared<const MLRNGeoJSONSourceProps>();
++  _props = defaultProps;
 +  [self prepareView];
 +}
 +
