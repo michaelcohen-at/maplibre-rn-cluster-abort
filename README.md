@@ -1,5 +1,23 @@
 # iOS: recycled `GeoJSONSource` component view retains a clustered `MLNShapeSource`, causing SIGABRT on next mount
 
+> **This branch (`fix/recycled-clustered-source`) carries the proposed fix.**
+> `patches/@maplibre+maplibre-react-native+11.3.6.patch` is applied to the library by `patch-package`
+> on `npm install`. With it, **Run repro** completes all four steps and renders the polygon;
+> `main` is the unpatched baseline, where the same sequence aborts at step 2.
+>
+> The patch makes the three changes listed under *Proposed fix*, each also proposed in
+> [maplibre/maplibre-react-native#1635](https://github.com/maplibre/maplibre-react-native/issues/1635).
+> Verified on the iOS 26.4 simulator: repro survives, control survives, and the `setShape:` filter's
+> warning never fires — fixes 1 and 2 stop the stale source being reached at all, so fix 3 stays
+> dormant as defence in depth.
+>
+> ```bash
+> git checkout fix/recycled-clustered-source
+> npm install                          # patch-package applies the patch (postinstall)
+> npx expo prebuild --platform ios
+> EXPO_PUBLIC_AUTORUN=repro npx expo run:ios
+> ```
+
 ## Summary
 
 When a `<GeoJSONSource cluster>` is unmounted and a non-clustered `<GeoJSONSource>` is subsequently
