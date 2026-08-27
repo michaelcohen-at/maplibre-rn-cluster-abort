@@ -1,0 +1,113 @@
+diff --git a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/MLRNSource.m b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/MLRNSource.m
+index bf0298d..1e33861 100644
+--- a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/MLRNSource.m
++++ b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/MLRNSource.m
+@@ -103,6 +103,11 @@
+ 
+   if (_source != nil) {
+     [_map.style removeSource:_source];
++    // Let go of it. The MLNShapeSource stays alive after removal and setShape:/setURL:
++    // only guard on `source != nil`, so a stale pointer here means the NEXT data push —
++    // including one from a recycled component view — lands in a source that is no
++    // longer this component's. See maplibre/maplibre-react-native#1635.
++    _source = nil;
+   }
+ }
+ 
+diff --git a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSource.m b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSource.m
+index aa913f8..0913d1b 100644
+--- a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSource.m
++++ b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSource.m
+@@ -1,6 +1,7 @@
+ #import "MLRNGeoJSONSource.h"
+ #import "MLRNMapView.h"
+ #import "MLRNUtils.h"
++#import <React/RCTLog.h>
+ 
+ @implementation MLRNGeoJSONSource
+ 
+@@ -29,10 +30,43 @@ static UIImage *_placeHolderImage;
+ 
+   if (self.source != nil) {
+     MLNShapeSource *source = (MLNShapeSource *)self.source;
+-    [source setShape:shape == nil ? nil : [MLRNUtils shapeFromGeoJSON:_shape]];
++    [source setShape:shape == nil ? nil
++                                  : [self clusterSafeShape:[MLRNUtils shapeFromGeoJSON:_shape]]];
+   }
+ }
+ 
++/// supercluster indexes Point features only. Any other geometry in a clustered
++/// FeatureCollection — a Polygon, a MultiPoint, or a feature whose `geometry` is
++/// null (legal GeoJSON, parsed as MLNEmptyFeature) — makes its Zoom constructor
++/// throw bad_variant_access from C++, which nothing on the ObjC side catches:
++/// the process aborts. Drop such features up front and say so, instead.
++/// Single (non-collection) shapes never reach supercluster and pass through.
++/// See maplibre/maplibre-react-native#1635.
++- (MLNShape *)clusterSafeShape:(MLNShape *)shape {
++  if (shape == nil || _cluster == nil || [_cluster intValue] != 1) {
++    return shape;
++  }
++  if (![shape isKindOfClass:[MLNShapeCollectionFeature class]]) {
++    return shape;
++  }
++  MLNShapeCollectionFeature *collection = (MLNShapeCollectionFeature *)shape;
++  NSMutableArray<MLNShape<MLNFeature> *> *points =
++      [NSMutableArray arrayWithCapacity:collection.shapes.count];
++  for (MLNShape<MLNFeature> *feature in collection.shapes) {
++    if ([feature isKindOfClass:[MLNPointFeature class]]) {
++      [points addObject:feature];
++    }
++  }
++  NSUInteger dropped = collection.shapes.count - points.count;
++  if (dropped == 0) {
++    return shape;
++  }
++  RCTLogWarn(@"[MLRNGeoJSONSource] source '%@' is clustered but %lu of %lu features are not "
++             @"Point geometries; they were dropped because supercluster cannot index them.",
++             self.id, (unsigned long)dropped, (unsigned long)collection.shapes.count);
++  return [MLNShapeCollectionFeature shapeCollectionWithShapes:points];
++}
++
+ - (void)addToMap {
+   if (self.map.style == nil) {
+     return;
+@@ -52,7 +86,7 @@ static UIImage *_placeHolderImage;
+   NSDictionary<MLNShapeSourceOption, id> *options = [self _getOptions];
+ 
+   if (_shape != nil) {
+-    MLNShape *shape = [MLRNUtils shapeFromGeoJSON:_shape];
++    MLNShape *shape = [self clusterSafeShape:[MLRNUtils shapeFromGeoJSON:_shape]];
+     return [[MLNShapeSource alloc] initWithIdentifier:self.id shape:shape options:options];
+   }
+ 
+diff --git a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
+index 4301ae7..2a9ee9a 100644
+--- a/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
++++ b/node_modules/@maplibre/maplibre-react-native/ios/components/sources/geojson-source/MLRNGeoJSONSourceComponentView.mm
+@@ -62,6 +62,26 @@ using namespace facebook::react;
+   return _view;
+ }
+ 
++- (void)prepareForRecycle {
++  [super prepareForRecycle];
++  // Fabric hands this view to the next <GeoJSONSource> of ANY kind. The wrapped
++  // MLRNGeoJSONSource still holds the previous component's MLNShapeSource — whose
++  // cluster options are immutable — so the next component's `data` would be pushed
++  // into it by setShape: before the new source is even created. A clustered source
++  // receiving non-Point features aborts the process from C++ (bad_variant_access in
++  // supercluster). Start the next life with a fresh wrapper, as MLRNCameraComponentView
++  // and MLRNLayerComponentView already do. See maplibre/maplibre-react-native#1635.
++  // And forget the previous props. Fabric passes oldProps:nullptr on Create, and
++  // updateProps diffs against _props — so without this reset, any prop that is
++  // EQUAL to the previous component's (a source remounting under the same id, the
++  // same cluster flag) is never applied to the fresh wrapper. A nil id then reaches
++  // -[MLNStyle sourceWithIdentifier:] and segfaults in strlen. Same pattern as
++  // MLRNCameraComponentView.prepareView.
++  static const auto defaultProps = std::make_shared<const MLRNGeoJSONSourceProps>();
++  _props = defaultProps;
++  [self prepareView];
++}
++
+ #pragma mark - RCTComponentViewProtocol
+ 
+ + (ComponentDescriptorProvider)componentDescriptorProvider {
